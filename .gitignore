@@ -1,0 +1,8 @@
+# Build output
+dist/
+__pycache__/
+
+# Per-user data written next to the program at runtime
+config.json
+quotes.json
+stats.json
