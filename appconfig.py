@@ -8,9 +8,10 @@ from pathlib import Path
 APP_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
 CONFIG_PATH = APP_DIR / "config.json"
 DEFAULTS = {"start_time": "09:00", "end_time": "18:00", "lunch_start": "12:00", "lunch_end": "13:00",
-            "fireworks": True, "show_quotes": True, "quote_interval": 30, "x": None, "y": None}
+            "fireworks": True, "show_quotes": True, "quote_seconds": 30, "zoom": 1.0, "x": None, "y": None}
 TIME_KEYS = ("start_time", "end_time", "lunch_start", "lunch_end")
-QUOTE_INTERVALS = (10, 15, 30, 60)
+QUOTE_SECONDS = (10, 30, 60, 120)
+ZOOM_MIN, ZOOM_MAX = 0.6, 2.0
 
 
 def parse_hhmm(text):
@@ -55,8 +56,12 @@ def load_config():
     for key in ("fireworks", "show_quotes"):
         if not isinstance(config[key], bool):
             config[key] = DEFAULTS[key]
-    if not isinstance(config["quote_interval"], int) or config["quote_interval"] < 1:
-        config["quote_interval"] = DEFAULTS["quote_interval"]
+    if not isinstance(config["quote_seconds"], int) or config["quote_seconds"] < 1:
+        config["quote_seconds"] = DEFAULTS["quote_seconds"]
+    zoom = config["zoom"]
+    valid_zoom = isinstance(zoom, (int, float)) and not isinstance(zoom, bool) and ZOOM_MIN <= zoom <= ZOOM_MAX
+    config["zoom"] = float(zoom) if valid_zoom else DEFAULTS["zoom"]
+    config.pop("quote_interval", None)  # 舊版泡泡用的「每幾分鐘」，已改成 quote_seconds
     return config
 
 

@@ -9,8 +9,7 @@ import tkinter as tk
 from collections import namedtuple
 from datetime import datetime, timedelta
 
-from appconfig import at_today, load_config, save_position
-from bubble import SpeechBubble, round_rect_points
+from appconfig import ZOOM_MAX, ZOOM_MIN, at_today, load_config, save_config, save_position
 from fireworks import launch_fireworks
 from monitors import is_on_screen
 from quotes import QuotePicker, load_quotes, period_by_time, period_of, record_play
@@ -18,6 +17,7 @@ from settings import SettingsWindow
 
 # 以下尺寸是 100% 縮放時的像素，實際會依螢幕 DPI 放大
 WIDTH, HEIGHT, RADIUS = 280, 130, 16
+MARQUEE_HEIGHT = 28  # 跑馬燈那一行的高度
 KEY = "#010203"  # 透明色，用來挖出圓角
 WHITE = "#ffffff"
 PALETTES = {
@@ -33,7 +33,9 @@ POP_MAX, POP_MIN = 52, 36  # 最後 10 秒數字放大縮回的字級
 ANIM_MS = 40
 RAINBOW_SECONDS = 60
 FIREWORKS_GRACE = timedelta(seconds=60)
-FIRST_QUOTE_DELAY = 5  # 秒
+MARQUEE_MS = 33  # 跑馬燈每一幀往左移 1px（依 DPI 放大），約每秒 30px
+ZOOM_PRESETS = (("小（80%）", 0.8), ("標準（100%）", 1.0), ("大（125%）", 1.25), ("特大（150%）", 1.5))
+ZOOM_STEP = 0.1
 
 State = namedtuple("State", "mode remaining progress lunch_text palette")
 
@@ -101,6 +103,12 @@ def shade(color, factor):
     return rgb_to_hex(v * factor for v in hex_to_rgb(color))
 
 
+def round_rect_points(x1, y1, x2, y2, r):
+    """搭配 create_polygon(smooth=True) 畫出圓角矩形。"""
+    return [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
+            x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+
+
 class ClockApp:
     def __init__(self, demo=False):
         self.config = load_config()
@@ -108,8 +116,9 @@ class ClockApp:
         self.offset = demo_offset(self.config) if demo else timedelta(0)
 
         self.root = tk.Tk()
-        self.scale = self.root.winfo_fpixels("1i") / 96
-        self.w, self.h = self.px(WIDTH), self.px(HEIGHT)
+        self.dpi_scale = self.root.winfo_fpixels("1i") / 96
+        self.zoom = self.config["zoom"]
+        self.compute_sizes()
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
         self.root.attributes("-transparentcolor", KEY)
@@ -118,18 +127,23 @@ class ClockApp:
         self.canvas.pack()
         self.build_items()
 
+        self.zoom_var = tk.DoubleVar(value=self.zoom)
+        size_menu = tk.Menu(self.root, tearoff=0)
+        for label, zoom in ZOOM_PRESETS:
+            size_menu.add_radiobutton(label=label, value=zoom, variable=self.zoom_var,
+                                      command=lambda z=zoom: self.set_zoom(z))
+        size_menu.add_separator()
+        size_menu.add_command(label="按住 Ctrl 滾動滑鼠滾輪可以微調", state="disabled")
+
         self.menu = tk.Menu(self.root, tearoff=0)
-        self.menu.add_command(label="來一句", command=self.quote_now)
+        self.menu.add_command(label="下一句", command=self.next_quote)
         self.menu.add_command(label="放煙火", command=lambda: launch_fireworks(self.root))
+        self.menu.add_cascade(label="大小", menu=size_menu)
         self.menu.add_command(label="設定…", command=self.open_settings)
         self.menu.add_command(label="重設位置", command=self.reset_position)
         self.menu.add_separator()
         self.menu.add_command(label="結束", command=self.root.destroy)
-
-        self.canvas.bind("<ButtonPress-1>", self.start_drag)
-        self.canvas.bind("<B1-Motion>", self.on_drag)
-        self.canvas.bind("<ButtonRelease-1>", self.end_drag)
-        self.canvas.bind("<Button-3>", self.show_menu)
+        self.bind_events(self.canvas)
 
         self.state = None
         self.palette = None
@@ -140,10 +154,14 @@ class ClockApp:
         self.animating = False
 
         self.picker = QuotePicker(load_quotes())
-        self.bubble = None
         self.settings = None
         self.last_period = None
-        self.next_quote_at = time.monotonic() + FIRST_QUOTE_DELAY
+        self.marquee_visible = False
+        self.marquee_running = False
+        self.marquee_x = 0
+        self.marquee_width = 0
+        self.quote_started = 0.0
+        self.force_next = False
 
         self.tick()
         self.place_window()
@@ -151,40 +169,80 @@ class ClockApp:
     def px(self, value):
         return round(value * self.scale)
 
+    def fs(self, size):
+        """字級（點）只需乘上縮放比例，DPI 的部分 Tk 會自己處理。"""
+        return round(size * self.zoom)
+
+    def compute_sizes(self):
+        self.scale = self.dpi_scale * self.zoom
+        self.w, self.h = self.px(WIDTH), self.px(HEIGHT)
+        self.base_h, self.full_h = self.h, self.px(HEIGHT + MARQUEE_HEIGHT)
+        self.pad = self.px(16)
+
+    def bind_events(self, widget):
+        widget.bind("<ButtonPress-1>", self.start_drag)
+        widget.bind("<B1-Motion>", self.on_drag)
+        widget.bind("<ButtonRelease-1>", self.end_drag)
+        widget.bind("<Button-3>", self.show_menu)
+        widget.bind("<Control-MouseWheel>", self.on_zoom_wheel)
+
     def now(self):
         return datetime.now().replace(microsecond=0) + self.offset
 
     # ---- 畫面元件 ----
 
     def build_items(self):
-        c, w, h, r = self.canvas, self.w, self.h, self.px(RADIUS)
+        c, w, r = self.canvas, self.w, self.px(RADIUS)
+        pad, bar_y = self.pad, self.px(90)
         # 每個像素欄一條垂直線組成漸層，依圓角半徑算出上下內縮量
         self.columns = []
+        self.insets = []
         for x in range(w):
             cx = x + 0.5
             d = max(r - cx, cx - (w - r), 0)
-            inset = r - math.sqrt(max(r * r - d * d, 0)) if d else 0
-            self.columns.append(c.create_line(x, inset, x, h - inset + 1))
+            self.insets.append(r - math.sqrt(max(r * r - d * d, 0)) if d else 0)
+            self.columns.append(c.create_line(x, 0, x, 0))
 
-        b = self.px(2)
-        self.glow = c.create_polygon(round_rect_points(b, b, w - b, h - b, r), smooth=True,
-                                     fill="", outline="", width=self.px(3), state="hidden")
+        # 跑馬燈放在獨立的小畫布，背景是一張接續外框漸層的圖：捲動時只需重畫文字和這張圖，
+        # 不用重畫上百條漸層線，超出左右的文字也會被小畫布自然裁掉
+        self.mq_w, self.mq_h = w - 2 * pad, self.px(MARQUEE_HEIGHT - 6)
+        self.mq = tk.Canvas(c, width=self.mq_w, height=self.mq_h, highlightthickness=0, bd=0)
+        self.mq_image = tk.PhotoImage(width=self.mq_w, height=self.mq_h)
+        self.mq.create_image(0, 0, image=self.mq_image, anchor="nw")
+        self.marquee_y = self.mq_h // 2
+        self.marquee = self.text_pair(self.mq_w, self.marquee_y, "w", (UI_FONT, self.fs(10)), canvas=self.mq)
+        self.bind_events(self.mq)
+        self.mq_window = c.create_window(pad, self.base_h, window=self.mq, anchor="nw", state="hidden")
+        self.separator = c.create_line(pad, self.base_h - self.px(4), w - pad, self.base_h - self.px(4),
+                                       state="hidden")
 
-        pad, bar_y = self.px(16), self.px(90)
+        self.glow = c.create_polygon(0, 0, 0, 0, smooth=True, fill="", outline="", width=self.px(3), state="hidden")
+        self.layout(self.h)
+
         self.track = c.create_line(pad, bar_y, w - self.px(64), bar_y, width=self.px(8), capstyle=tk.ROUND)
         self.bar = c.create_line(pad, bar_y, pad, bar_y, width=self.px(8), capstyle=tk.ROUND, fill=WHITE)
 
-        self.title = self.text_pair(pad, self.px(14), "nw", (UI_FONT, 10))
-        self.tag = self.text_pair(w - pad, self.px(14), "ne", (UI_FONT, 10, "bold"))
-        self.big = self.text_pair(w // 2, self.px(54), "center", (DIGIT_FONT, 30, "bold"), self.px(2))
-        self.percent = self.text_pair(w - pad, bar_y, "e", (DIGIT_FONT, 10, "bold"))
-        self.lunch = self.text_pair(pad, self.px(112), "w", (UI_FONT, 10))
+        self.title = self.text_pair(pad, self.px(14), "nw", (UI_FONT, self.fs(10)))
+        self.tag = self.text_pair(w - pad, self.px(14), "ne", (UI_FONT, self.fs(10), "bold"))
+        self.big = self.text_pair(w // 2, self.px(54), "center", (DIGIT_FONT, self.fs(30), "bold"), self.px(2))
+        self.percent = self.text_pair(w - pad, bar_y, "e", (DIGIT_FONT, self.fs(10), "bold"))
+        self.lunch = self.text_pair(pad, self.px(112), "w", (UI_FONT, self.fs(10)))
 
-    def text_pair(self, x, y, anchor, font, shadow=None):
+    def layout(self, h):
+        """改變時鐘高度：重新計算漸層欄和發光外框的座標。"""
+        self.h = h
+        self.canvas.configure(height=h)
+        for x, (item, inset) in enumerate(zip(self.columns, self.insets)):
+            self.canvas.coords(item, x, inset, x, h - inset + 1)
+        b = self.px(2)
+        self.canvas.coords(self.glow, *round_rect_points(b, b, self.w - b, h - b, self.px(RADIUS)))
+
+    def text_pair(self, x, y, anchor, font, shadow=None, canvas=None):
         """白字加一層往右下偏移的陰影，回傳 (陰影, 文字)。"""
+        canvas = canvas or self.canvas
         d = shadow if shadow is not None else self.px(1)
-        back = self.canvas.create_text(x + d, y + d, anchor=anchor, font=font)
-        front = self.canvas.create_text(x, y, anchor=anchor, font=font, fill=WHITE)
+        back = canvas.create_text(x + d, y + d, anchor=anchor, font=font)
+        front = canvas.create_text(x, y, anchor=anchor, font=font, fill=WHITE)
         return back, front
 
     def set_text(self, pair, text):
@@ -204,19 +262,28 @@ class ClockApp:
     def set_shadow_color(self, color):
         for pair in (self.title, self.tag, self.big, self.percent, self.lunch):
             self.canvas.itemconfigure(pair[0], fill=color)
+        self.mq.itemconfigure(self.marquee[0], fill=color)
+
+    def set_track_color(self, color):
+        for item in (self.track, self.separator):
+            self.canvas.itemconfigure(item, fill=color)
 
     def paint_palette(self, name):
         if name == "off":
             self.paint_rainbow(0.0)
-            self.canvas.itemconfigure(self.track, fill="#333355")
+            self.set_track_color("#333355")
             self.set_shadow_color("#333355")
             return
         c1, c2 = PALETTES[name]
         last = max(len(self.columns) - 1, 1)
-        for i, item in enumerate(self.columns):
-            self.canvas.itemconfigure(item, fill=mix(c1, c2, i / last))
+        colors = [mix(c1, c2, i / last) for i in range(len(self.columns))]
+        for item, color in zip(self.columns, colors):
+            self.canvas.itemconfigure(item, fill=color)
+        # 跑馬燈背景圖：取同一段漸層，接起來看不出接縫
+        row = "{" + " ".join(colors[self.pad:self.pad + self.mq_w]) + "}"
+        self.mq_image.put(" ".join([row] * self.mq_h))
         mid = mix(c1, c2, 0.5)
-        self.canvas.itemconfigure(self.track, fill=shade(mid, 0.6))
+        self.set_track_color(shade(mid, 0.6))
         self.set_shadow_color(shade(mid, 0.45))
 
     def paint_rainbow(self, offset):
@@ -239,9 +306,9 @@ class ClockApp:
             if self.config["fireworks"] and now - at_today(now, self.config["end_time"]) <= FIREWORKS_GRACE:
                 launch_fireworks(self.root)
         self.state = state
+        self.update_quotes(now)  # 先決定跑馬燈要不要顯示，時鐘高度才會正確
         self.render(state)
         self.ensure_animation()
-        self.update_quotes(now)
         # 對齊到下一個整秒，避免累積誤差跳秒
         delay = 1000 - datetime.now().microsecond // 1000
         self.root.after(delay, self.tick)
@@ -261,7 +328,7 @@ class ClockApp:
             for item in (self.track, self.bar):
                 self.canvas.itemconfigure(item, state="hidden")
             self.set_text(self.big, "今天放假" if state.mode == "weekend" else "下班囉！")
-            self.set_big_font((UI_FONT, 24, "bold"))
+            self.set_big_font((UI_FONT, self.fs(24), "bold"))
             self.move_text(self.big, self.w // 2, self.h // 2)
             return
 
@@ -281,12 +348,12 @@ class ClockApp:
             if seconds != self.shown_seconds:
                 self.shown_seconds = seconds
                 self.pop_start = time.monotonic()
-                self.set_big_font((DIGIT_FONT, POP_MAX, "bold"))
+                self.set_big_font((DIGIT_FONT, self.fs(POP_MAX), "bold"))
             self.set_text(self.big, str(seconds))
         else:
             self.shown_seconds = None
             self.set_text(self.big, fmt(state.remaining))
-            self.set_big_font((DIGIT_FONT, 30, "bold"))
+            self.set_big_font((DIGIT_FONT, self.fs(30), "bold"))
 
     # ---- 動畫：只在最後一小時、最後 10 秒、剛下班時執行 ----
 
@@ -312,7 +379,7 @@ class ClockApp:
         if state.mode == "final10":
             k = min((t - self.pop_start) / 0.35, 1.0)
             ease = 1 - (1 - k) ** 3
-            self.set_big_font((DIGIT_FONT, round(POP_MAX - (POP_MAX - POP_MIN) * ease), "bold"))
+            self.set_big_font((DIGIT_FONT, self.fs(POP_MAX - (POP_MAX - POP_MIN) * ease), "bold"))
         if state.mode == "off":
             self.paint_rainbow(t * 0.25 % 1)
         self.root.after(ANIM_MS, self.animate)
@@ -321,35 +388,94 @@ class ClockApp:
 
     def update_quotes(self, now):
         period = period_of(now, self.config)
-        changed = period != self.last_period and self.last_period is not None
+        if period and self.last_period and period != self.last_period:
+            self.force_next = True  # 進入或結束午休：這一圈跑完就換成新時段的小語
         self.last_period = period
-        if not self.config["show_quotes"] or period is None:
-            return
-        if changed or time.monotonic() >= self.next_quote_at:
-            self.show_quote(period)
+        self.set_marquee_visible(self.config["show_quotes"] and period is not None)
 
-    def quote_now(self):
-        # 手動「來一句」不受週末、下班或開關限制
-        self.show_quote(period_by_time(self.now(), self.config))
-
-    def show_quote(self, period):
-        self.next_quote_at = time.monotonic() + self.config["quote_interval"] * 60
-        quote = self.picker.pick(period)
-        if not quote:
+    def set_marquee_visible(self, visible):
+        if visible == self.marquee_visible:
             return
-        if not self.demo:
+        self.marquee_visible = visible
+        self.layout(self.full_h if visible else self.base_h)
+        for item in (self.mq_window, self.separator):
+            self.canvas.itemconfigure(item, state="normal" if visible else "hidden")
+        if visible:
+            self.next_quote()
+            if not self.marquee_running:
+                self.marquee_running = True
+                self.scroll()
+
+    def next_quote(self):
+        """換下一句，從右邊重新捲進來。"""
+        if not self.marquee_visible:
+            return
+        period = self.last_period or period_by_time(self.now(), self.config)
+        quote = self.picker.pick(period) or ""
+        if quote and not self.demo:
             record_play(period, quote)
-        self.close_bubble()
-        accent = PALETTES.get(self.palette, PALETTES["lasthour"])[0]
-        self.bubble = SpeechBubble(self.root, quote, self.window_rect(), accent, self.scale)
+        self.set_marquee_text(quote)
+        self.quote_started = time.monotonic()
+        self.force_next = False
 
-    def close_bubble(self):
-        if self.bubble:
-            self.bubble.close()
-            self.bubble = None
+    def set_marquee_text(self, quote):
+        for item in self.marquee:
+            self.mq.itemconfigure(item, text=quote)
+        x1, _, x2, _ = self.mq.bbox(self.marquee[1])
+        self.marquee_width = x2 - x1
+        self.restart_marquee()
 
-    def window_rect(self):
-        return self.root.winfo_x(), self.root.winfo_y(), self.w, self.h
+    def restart_marquee(self):
+        """把文字放回小畫布右邊外側，重新捲進來。"""
+        self.marquee_x = self.mq_w
+        back, front = self.marquee
+        d = self.px(1)
+        self.mq.coords(front, self.marquee_x, self.marquee_y)
+        self.mq.coords(back, self.marquee_x + d, self.marquee_y + d)
+
+    def scroll(self):
+        if not self.marquee_visible:
+            self.marquee_running = False
+            return
+        step = max(self.px(1), 1)
+        self.marquee_x -= step
+        for item in self.marquee:
+            self.mq.move(item, -step, 0)
+        if self.marquee_x + self.marquee_width < 0:
+            # 整句捲出左邊，這一圈跑完：時間到了才換下一句，否則同一句再跑一圈
+            if self.force_next or time.monotonic() - self.quote_started >= self.config["quote_seconds"]:
+                self.next_quote()
+            else:
+                self.restart_marquee()
+        self.root.after(MARQUEE_MS, self.scroll)
+
+    # ---- 縮放 ----
+
+    def on_zoom_wheel(self, event):
+        self.set_zoom(self.zoom + (ZOOM_STEP if event.delta > 0 else -ZOOM_STEP))
+
+    def set_zoom(self, zoom):
+        zoom = round(min(max(zoom, ZOOM_MIN), ZOOM_MAX), 2)
+        self.zoom_var.set(zoom)
+        if zoom == self.zoom:
+            return
+        self.zoom = zoom
+        quote = self.mq.itemcget(self.marquee[1], "text")
+        # 所有尺寸和字級都跟著縮放比例變，直接整個畫面重建
+        self.mq.destroy()
+        self.canvas.delete("all")
+        self.compute_sizes()
+        self.canvas.configure(width=self.w)
+        self.build_items()
+        self.palette = self.big_font = self.shown_seconds = None
+        if self.marquee_visible:
+            self.layout(self.full_h)
+            for item in (self.mq_window, self.separator):
+                self.canvas.itemconfigure(item, state="normal")
+            self.set_marquee_text(quote)  # 同一句從頭再跑，不算新的一次播放
+        self.render(self.state)
+        if not self.demo:
+            save_config({"zoom": zoom})
 
     # ---- 設定畫面 ----
 
@@ -362,7 +488,7 @@ class ClockApp:
     def apply_settings(self):
         self.config = load_config()
         self.picker.set_quotes(load_quotes())
-        self.next_quote_at = time.monotonic() + self.config["quote_interval"] * 60
+        self.next_quote()  # 小語可能改過，馬上換一句
 
     # ---- 視窗位置與選單 ----
 
@@ -382,14 +508,14 @@ class ClockApp:
         dx, dy = self.drag_offset
         x, y = event.x_root - dx, event.y_root - dy
         self.root.geometry(f"+{x}+{y}")
-        if self.bubble:
-            self.bubble.follow((x, y, self.w, self.h))
 
     def end_drag(self, event):
         if not self.demo:
             save_position(self.root.winfo_x(), self.root.winfo_y())
 
     def show_menu(self, event):
+        # 跑馬燈沒顯示時（週末、下班後、關掉小語），「下一句」沒有作用
+        self.menu.entryconfigure(0, state="normal" if self.marquee_visible else "disabled")
         self.menu.tk_popup(event.x_root, event.y_root)
 
     def reset_position(self):

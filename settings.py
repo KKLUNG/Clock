@@ -5,7 +5,7 @@ import tkinter.font as tkfont
 from tkinter import messagebox, ttk
 
 import autostart
-from appconfig import QUOTE_INTERVALS, TIME_KEYS, load_config, save_config
+from appconfig import QUOTE_SECONDS, TIME_KEYS, load_config, save_config
 from default_quotes import DEFAULT_QUOTES
 from fireworks import launch_fireworks
 from monitors import work_area_at
@@ -110,11 +110,11 @@ class SettingsWindow:
         top.pack(fill="x")
         self.show_quotes_var = tk.BooleanVar(value=self.config["show_quotes"])
         ttk.Checkbutton(top, text="顯示心情小語", variable=self.show_quotes_var).pack(side="left")
-        intervals = sorted(set(QUOTE_INTERVALS) | {self.config["quote_interval"]})
-        self.interval_box = ttk.Combobox(top, state="readonly", width=8, values=[f"{n} 分鐘" for n in intervals])
-        self.interval_box.set(f"{self.config['quote_interval']} 分鐘")
-        self.interval_box.pack(side="right")
-        ttk.Label(top, text="換句頻率").pack(side="right", padx=(0, 6))
+        seconds = sorted(set(QUOTE_SECONDS) | {self.config["quote_seconds"]})
+        self.seconds_box = ttk.Combobox(top, state="readonly", width=8, values=[f"{n} 秒" for n in seconds])
+        self.seconds_box.set(f"{self.config['quote_seconds']} 秒")
+        self.seconds_box.pack(side="right")
+        ttk.Label(top, text="每句至少顯示").pack(side="right", padx=(0, 6))
 
         period_row = ttk.Frame(frame)
         period_row.pack(fill="x", pady=(14, 6))
@@ -303,7 +303,7 @@ class SettingsWindow:
         if times is None:
             return
         updates = dict(times, fireworks=self.fireworks_var.get(), show_quotes=self.show_quotes_var.get(),
-                       quote_interval=int(self.interval_box.get().split()[0]))
+                       quote_seconds=int(self.seconds_box.get().split()[0]))
         saved = save_config(updates)
         if self.quotes_changed:
             saved = save_quotes(self.quotes) and saved
