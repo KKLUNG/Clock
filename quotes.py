@@ -2,7 +2,7 @@
 
 import random
 
-from appconfig import APP_DIR, at_today, read_json, write_json
+from appconfig import APP_DIR, at_today, effective_end, read_json, write_json
 from default_quotes import DEFAULT_QUOTES
 
 QUOTES_PATH = APP_DIR / "quotes.json"
@@ -20,8 +20,8 @@ def period_by_time(now, config):
 
 
 def period_of(now, config):
-    """自動播放用的時段；週末或下班後回傳 None，不跳小語。"""
-    if now.weekday() >= 5 or now >= at_today(now, config["end_time"]):
+    """自動播放用的時段；週末或下班後回傳 None，不跳小語。加班時繼續播下午的小語。"""
+    if now.weekday() >= 5 or now >= effective_end(now, config):
         return None
     return period_by_time(now, config)
 

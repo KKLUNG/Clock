@@ -2,18 +2,21 @@
 
 import tkinter as tk
 import tkinter.font as tkfont
+from datetime import datetime
 from tkinter import messagebox, ttk
 
 import autostart
-from appconfig import QUOTE_SECONDS, TIME_KEYS, load_config, save_config
+from appconfig import QUOTE_SECONDS, TIME_KEYS, load_config, overtime_active, save_config
 from default_quotes import DEFAULT_QUOTES
 from fireworks import launch_fireworks
 from monitors import work_area_at
 from quotes import PERIOD_NAMES, PERIODS, clear_stats, load_quotes, load_stats, save_quotes
+from themes import THEMES
 
 UI_FONT = "Microsoft JhengHei UI"
 TITLE = "下班倒數 設定"
-TIME_LABELS = {"start_time": "上班時間", "end_time": "下班時間", "lunch_start": "午休開始", "lunch_end": "午休結束"}
+TIME_LABELS = {"start_time": "上班時間", "end_time": "下班時間", "lunch_start": "午休開始", "lunch_end": "午休結束",
+               "overtime_end": "加班到"}
 STATS_COLUMNS = (("period", "時段", 60, "center"), ("quote", "小語", 380, "w"), ("count", "次數", 60, "center"))
 
 
@@ -78,29 +81,46 @@ class SettingsWindow:
         self.time_inputs = {}
         for i, key in enumerate(TIME_KEYS):
             row, col = divmod(i, 2)
-            c = col * 4
-            ttk.Label(frame, text=TIME_LABELS[key]).grid(row=row, column=c, sticky="w",
-                                                         padx=(0 if col == 0 else 32, 8), pady=6)
-            h, m = self.config[key].split(":")
-            hour = ttk.Spinbox(frame, from_=0, to=23, width=3, format="%02.0f", wrap=True, justify="center")
-            minute = ttk.Spinbox(frame, from_=0, to=59, increment=5, width=3, format="%02.0f", wrap=True,
-                                 justify="center")
-            hour.set(h)
-            minute.set(m)
-            hour.grid(row=row, column=c + 1)
-            ttk.Label(frame, text=":").grid(row=row, column=c + 2, padx=2)
-            minute.grid(row=row, column=c + 3)
-            self.time_inputs[key] = (hour, minute)
+            self.time_input(frame, key, row, col)
+
+        # 加班：只記勾選當天的日期，隔天自動失效
+        self.time_input(frame, "overtime_end", 2, 0)
+        self.overtime_var = tk.BooleanVar(value=overtime_active(datetime.now(), self.config))
+        ttk.Checkbutton(frame, text="今天加班", variable=self.overtime_var).grid(
+            row=2, column=4, columnspan=4, sticky="w", padx=(32, 0), pady=6)
+
+        ttk.Label(frame, text="變色模式").grid(row=3, column=0, sticky="w", pady=(16, 6))
+        self.theme_keys = list(THEMES)
+        self.theme_box = ttk.Combobox(frame, state="readonly", width=8,
+                                      values=[THEMES[k]["name"] for k in self.theme_keys])
+        self.theme_box.set(THEMES[self.config["theme"]]["name"])
+        self.theme_box.grid(row=3, column=1, columnspan=3, sticky="w", pady=(16, 6))
 
         self.fireworks_var = tk.BooleanVar(value=self.config["fireworks"])
         self.autostart_var = tk.BooleanVar(value=autostart.is_enabled())
         ttk.Checkbutton(frame, text="下班時放煙火", variable=self.fireworks_var).grid(
-            row=2, column=0, columnspan=4, sticky="w", pady=(20, 4))
+            row=4, column=0, columnspan=4, sticky="w", pady=(16, 4))
         ttk.Button(frame, text="測試煙火", command=lambda: launch_fireworks(self.root)).grid(
-            row=2, column=4, columnspan=4, sticky="w", padx=(32, 0), pady=(20, 4))
+            row=4, column=4, columnspan=4, sticky="w", padx=(32, 0), pady=(16, 4))
         ttk.Checkbutton(frame, text="開機自動執行", variable=self.autostart_var).grid(
-            row=3, column=0, columnspan=8, sticky="w", pady=4)
+            row=5, column=0, columnspan=8, sticky="w", pady=4)
         return frame
+
+    def time_input(self, frame, key, row, col):
+        """一組「標籤 [時]:[分]」，佔 4 欄。"""
+        c = col * 4
+        ttk.Label(frame, text=TIME_LABELS[key]).grid(row=row, column=c, sticky="w",
+                                                     padx=(0 if col == 0 else 32, 8), pady=6)
+        h, m = self.config[key].split(":")
+        hour = ttk.Spinbox(frame, from_=0, to=23, width=3, format="%02.0f", wrap=True, justify="center")
+        minute = ttk.Spinbox(frame, from_=0, to=59, increment=5, width=3, format="%02.0f", wrap=True,
+                             justify="center")
+        hour.set(h)
+        minute.set(m)
+        hour.grid(row=row, column=c + 1)
+        ttk.Label(frame, text=":").grid(row=row, column=c + 2, padx=2)
+        minute.grid(row=row, column=c + 3)
+        self.time_inputs[key] = (hour, minute)
 
     # ---- 分頁 2：心情小語 ----
 
@@ -296,14 +316,20 @@ class SettingsWindow:
         if times["lunch_start"] >= times["lunch_end"]:
             messagebox.showerror(TITLE, "午休開始要早於午休結束。", parent=self.win)
             return None
+        if times["overtime_end"] <= times["end_time"]:
+            messagebox.showerror(TITLE, "加班時間要晚於下班時間。", parent=self.win)
+            return None
         return times
 
     def save(self):
         times = self.read_times()
         if times is None:
             return
+        theme = self.theme_keys[self.theme_box.current()]
+        overtime_date = datetime.now().date().isoformat() if self.overtime_var.get() else None
         updates = dict(times, fireworks=self.fireworks_var.get(), show_quotes=self.show_quotes_var.get(),
-                       quote_seconds=int(self.seconds_box.get().split()[0]))
+                       quote_seconds=int(self.seconds_box.get().split()[0]), theme=theme,
+                       overtime_date=overtime_date)
         saved = save_config(updates)
         if self.quotes_changed:
             saved = save_quotes(self.quotes) and saved

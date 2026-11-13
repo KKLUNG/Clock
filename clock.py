@@ -9,24 +9,21 @@ import tkinter as tk
 from collections import namedtuple
 from datetime import datetime, timedelta
 
-from appconfig import ZOOM_MAX, ZOOM_MIN, at_today, load_config, save_config, save_position
+from appconfig import (ZOOM_MAX, ZOOM_MIN, at_today, effective_end, load_config, overtime_active, save_config,
+                       save_position)
 from fireworks import launch_fireworks
 from monitors import is_on_screen
 from quotes import QuotePicker, load_quotes, period_by_time, period_of, record_play
 from settings import SettingsWindow
+from sky import SkyDecor
+from themes import THEMES
 
 # 以下尺寸是 100% 縮放時的像素，實際會依螢幕 DPI 放大
 WIDTH, HEIGHT, RADIUS = 280, 130, 16
 MARQUEE_HEIGHT = 28  # 跑馬燈那一行的高度
 KEY = "#010203"  # 透明色，用來挖出圓角
 WHITE = "#ffffff"
-PALETTES = {
-    "morning": ("#3a7bd5", "#00d2ff"),
-    "afternoon": ("#f7971e", "#ffd200"),
-    "lasthour": ("#ff0080", "#7928ca"),
-    "weekend": ("#11998e", "#38ef7d"),
-}
-GLOW_COLORS = ("#ffffff", "#ff66c4")
+RAINBOW_DARK = "#333355"  # 彩虹背景上的陰影和進度條軌道色
 UI_FONT = "Microsoft JhengHei UI"
 DIGIT_FONT = "Consolas"
 POP_MAX, POP_MIN = 52, 36  # 最後 10 秒數字放大縮回的字級
@@ -37,7 +34,7 @@ MARQUEE_MS = 33  # 跑馬燈每一幀往左移 1px（依 DPI 放大），約每�
 ZOOM_PRESETS = (("小（80%）", 0.8), ("標準（100%）", 1.0), ("大（125%）", 1.25), ("特大（150%）", 1.5))
 ZOOM_STEP = 0.1
 
-State = namedtuple("State", "mode remaining progress lunch_text palette")
+State = namedtuple("State", "mode remaining progress lunch_text palette closing title")
 
 
 def fmt(delta):
@@ -49,32 +46,49 @@ def fmt(delta):
 
 def get_state(now, config):
     if now.weekday() >= 5:
-        return State("weekend", None, 0.0, "", "weekend")
+        return State("weekend", None, 0.0, "", "weekend", False, "")
     end = at_today(now, config["end_time"])
-    if now >= end:
-        return State("off", None, 1.0, "", "off")
-    start = at_today(now, config["start_time"])
-    remaining = end - now
-    total = (end - start).total_seconds()
+    final_end = effective_end(now, config)  # 有加班就是加班結束時間
+    if now >= final_end:
+        return State("off", None, 1.0, "", "off", False, "")
+
+    overtime = now >= end
+    if overtime:
+        start, target, title = end, final_end, "加班倒數"
+    else:
+        start, target, title = at_today(now, config["start_time"]), end, "下班倒數"
+    remaining = target - now
+    total = (target - start).total_seconds()
     progress = min(max((now - start).total_seconds() / total, 0.0), 1.0) if total > 0 else 0.0
 
     lunch_start = at_today(now, config["lunch_start"])
     lunch_end = at_today(now, config["lunch_end"])
-    if now < lunch_start:
+    if overtime:
+        lunch_text = ""
+    elif now < lunch_start:
         lunch_text = f"午休倒數 {fmt(lunch_start - now)}"
     elif now < lunch_end:
         lunch_text = "午休中"
     else:
         lunch_text = ""
 
-    if remaining <= timedelta(hours=1):
+    # 「快下班」看的是今天真正下班的時間：有加班時，原本下班前的最後一小時不算
+    closing = final_end - now <= timedelta(hours=1)
+    if overtime:
+        palette = "overtime"
+    elif closing:
         palette = "lasthour"
-    elif now < lunch_end:
+    elif now < lunch_start:
         palette = "morning"
+    elif now < lunch_end:
+        palette = "noon"
     else:
         palette = "afternoon"
-    mode = "final10" if remaining <= timedelta(seconds=10) else "working"
-    return State(mode, remaining, progress, lunch_text, palette)
+    if final_end - now <= timedelta(seconds=10):
+        mode = "final10"
+    else:
+        mode = "overtime" if overtime else "working"
+    return State(mode, remaining, progress, lunch_text, palette, closing, title)
 
 
 def demo_offset(config):
@@ -116,6 +130,7 @@ class ClockApp:
         self.offset = demo_offset(self.config) if demo else timedelta(0)
 
         self.root = tk.Tk()
+        self.theme = THEMES[self.config["theme"]]
         self.dpi_scale = self.root.winfo_fpixels("1i") / 96
         self.zoom = self.config["zoom"]
         self.compute_sizes()
@@ -135,9 +150,18 @@ class ClockApp:
         size_menu.add_separator()
         size_menu.add_command(label="按住 Ctrl 滾動滑鼠滾輪可以微調", state="disabled")
 
+        self.theme_var = tk.StringVar(value=self.config["theme"])
+        theme_menu = tk.Menu(self.root, tearoff=0)
+        for key, theme in THEMES.items():
+            theme_menu.add_radiobutton(label=theme["name"], value=key, variable=self.theme_var,
+                                       command=lambda k=key: self.set_theme(k))
+
+        self.overtime_var = tk.BooleanVar()
         self.menu = tk.Menu(self.root, tearoff=0)
         self.menu.add_command(label="下一句", command=self.next_quote)
         self.menu.add_command(label="放煙火", command=lambda: launch_fireworks(self.root))
+        self.menu.add_checkbutton(label="今天加班", variable=self.overtime_var, command=self.toggle_overtime)
+        self.menu.add_cascade(label="變色模式", menu=theme_menu)
         self.menu.add_cascade(label="大小", menu=size_menu)
         self.menu.add_command(label="設定…", command=self.open_settings)
         self.menu.add_command(label="重設位置", command=self.reset_position)
@@ -218,6 +242,8 @@ class ClockApp:
 
         self.glow = c.create_polygon(0, 0, 0, 0, smooth=True, fill="", outline="", width=self.px(3), state="hidden")
         self.layout(self.h)
+        self.column_colors = None
+        self.sky = SkyDecor(c, self.px, w, pad)  # 畫在漸層之上、文字和進度條之下
 
         self.track = c.create_line(pad, bar_y, w - self.px(64), bar_y, width=self.px(8), capstyle=tk.ROUND)
         self.bar = c.create_line(pad, bar_y, pad, bar_y, width=self.px(8), capstyle=tk.ROUND, fill=WHITE)
@@ -259,32 +285,48 @@ class ClockApp:
         self.canvas.coords(front, x, y)
         self.canvas.coords(back, x + dx, y + dy)
 
-    def set_shadow_color(self, color):
-        for pair in (self.title, self.tag, self.big, self.percent, self.lunch):
-            self.canvas.itemconfigure(pair[0], fill=color)
-        self.mq.itemconfigure(self.marquee[0], fill=color)
+    def set_text_colors(self, fg, shadow):
+        for back, front in (self.title, self.tag, self.big, self.percent, self.lunch):
+            self.canvas.itemconfigure(back, fill=shadow)
+            self.canvas.itemconfigure(front, fill=fg)
+        self.mq.itemconfigure(self.marquee[0], fill=shadow)
+        self.mq.itemconfigure(self.marquee[1], fill=fg)
 
     def set_track_color(self, color):
         for item in (self.track, self.separator):
             self.canvas.itemconfigure(item, fill=color)
 
     def paint_palette(self, name):
-        if name == "off":
+        theme = self.theme
+        self.canvas.itemconfigure(self.bar, fill=theme["bar"])
+        colors_pair = theme["palettes"][name]
+        if colors_pair == "rainbow":
+            self.column_colors = None
             self.paint_rainbow(0.0)
-            self.set_track_color("#333355")
-            self.set_shadow_color("#333355")
+            self.set_track_color(RAINBOW_DARK)
+            self.set_text_colors(theme["fg"], RAINBOW_DARK)
             return
-        c1, c2 = PALETTES[name]
+        c1, c2 = colors_pair
         last = max(len(self.columns) - 1, 1)
         colors = [mix(c1, c2, i / last) for i in range(len(self.columns))]
+        self.column_colors = colors  # 天空模式畫彎月時要用到背景色
         for item, color in zip(self.columns, colors):
             self.canvas.itemconfigure(item, fill=color)
         # 跑馬燈背景圖：取同一段漸層，接起來看不出接縫
         row = "{" + " ".join(colors[self.pad:self.pad + self.mq_w]) + "}"
         self.mq_image.put(" ".join([row] * self.mq_h))
         mid = mix(c1, c2, 0.5)
-        self.set_track_color(shade(mid, 0.6))
-        self.set_shadow_color(shade(mid, 0.45))
+        if theme["shadow"] == "light":  # 淺色底：深色字配淺色陰影
+            self.set_track_color(shade(mid, 0.85))
+            self.set_text_colors(theme["fg"], mix(mid, WHITE, 0.6))
+        else:
+            self.set_track_color(shade(mid, 0.6))
+            self.set_text_colors(theme["fg"], shade(mid, 0.45))
+
+    def color_at(self, x):
+        if not self.column_colors:
+            return RAINBOW_DARK
+        return self.column_colors[min(max(int(x), 0), len(self.column_colors) - 1)]
 
     def paint_rainbow(self, offset):
         for i, item in enumerate(self.columns):
@@ -299,19 +341,22 @@ class ClockApp:
     # ---- 每秒更新 ----
 
     def tick(self):
+        self.refresh()
+        # 對齊到下一個整秒，避免累積誤差跳秒
+        delay = 1000 - datetime.now().microsecond // 1000
+        self.root.after(delay, self.tick)
+
+    def refresh(self):
         now = self.now()
         state = get_state(now, self.config)
-        if self.state and self.state.mode in ("working", "final10") and state.mode == "off":
+        if self.state and self.state.mode in ("working", "overtime", "final10") and state.mode == "off":
             # 睡眠醒來時已經超過下班時間太久就不放
-            if self.config["fireworks"] and now - at_today(now, self.config["end_time"]) <= FIREWORKS_GRACE:
+            if self.config["fireworks"] and now - effective_end(now, self.config) <= FIREWORKS_GRACE:
                 launch_fireworks(self.root)
         self.state = state
         self.update_quotes(now)  # 先決定跑馬燈要不要顯示，時鐘高度才會正確
         self.render(state)
         self.ensure_animation()
-        # 對齊到下一個整秒，避免累積誤差跳秒
-        delay = 1000 - datetime.now().microsecond // 1000
-        self.root.after(delay, self.tick)
 
     def render(self, state):
         if state.palette != self.palette:
@@ -319,8 +364,13 @@ class ClockApp:
             self.paint_palette(state.palette)
             if state.palette == "off":
                 self.rainbow_until = time.monotonic() + RAINBOW_SECONDS
-        if state.palette != "lasthour":
-            self.canvas.itemconfigure(self.glow, state="hidden")
+        if not state.closing:
+            # 霓虹模式的外框一直亮著，其他模式只有快下班時才發光（由 animate 負責閃爍）
+            border = self.theme["border"]
+            self.canvas.itemconfigure(self.glow, state="normal" if border else "hidden", outline=border or "")
+        if self.theme["sky"]:
+            t = 0.5 if state.mode == "weekend" else state.progress
+            self.sky.update(state.palette, t, self.color_at)
 
         if state.mode in ("weekend", "off"):
             for pair in (self.title, self.tag, self.percent, self.lunch):
@@ -333,8 +383,8 @@ class ClockApp:
             return
 
         final10 = state.mode == "final10"
-        self.set_text(self.title, "" if final10 else "下班倒數")
-        self.set_text(self.tag, "快下班了！" if state.palette == "lasthour" and not final10 else "")
+        self.set_text(self.title, "" if final10 else state.title)
+        self.set_text(self.tag, "快下班了！" if state.closing and not final10 else "")
         self.set_text(self.lunch, state.lunch_text)
         self.set_text(self.percent, f"{int(state.progress * 100)}%")
         self.canvas.itemconfigure(self.track, state="normal")
@@ -358,9 +408,10 @@ class ClockApp:
     # ---- 動畫：只在最後一小時、最後 10 秒、剛下班時執行 ----
 
     def needs_animation(self):
-        if self.state.palette == "lasthour":
+        if self.state.closing:
             return True
-        return self.state.mode == "off" and time.monotonic() < self.rainbow_until
+        rainbow = self.theme["palettes"]["off"] == "rainbow"
+        return rainbow and self.state.mode == "off" and time.monotonic() < self.rainbow_until
 
     def ensure_animation(self):
         if not self.animating and self.needs_animation():
@@ -373,14 +424,14 @@ class ClockApp:
             return
         t = time.monotonic()
         state = self.state
-        if state.palette == "lasthour":
+        if state.closing:
             pulse = (math.sin(t * 2 * math.pi / 1.6) + 1) / 2
-            self.canvas.itemconfigure(self.glow, state="normal", outline=mix(*GLOW_COLORS, pulse))
+            self.canvas.itemconfigure(self.glow, state="normal", outline=mix(*self.theme["glow"], pulse))
         if state.mode == "final10":
             k = min((t - self.pop_start) / 0.35, 1.0)
             ease = 1 - (1 - k) ** 3
             self.set_big_font((DIGIT_FONT, self.fs(POP_MAX - (POP_MAX - POP_MIN) * ease), "bold"))
-        if state.mode == "off":
+        if state.mode == "off" and self.column_colors is None:
             self.paint_rainbow(t * 0.25 % 1)
         self.root.after(ANIM_MS, self.animate)
 
@@ -488,7 +539,31 @@ class ClockApp:
     def apply_settings(self):
         self.config = load_config()
         self.picker.set_quotes(load_quotes())
+        self.apply_theme()
         self.next_quote()  # 小語可能改過，馬上換一句
+
+    # ---- 變色模式與加班 ----
+
+    def apply_theme(self):
+        self.theme = THEMES[self.config["theme"]]
+        self.theme_var.set(self.config["theme"])
+        self.palette = None  # 強制重新上色
+        self.sky.hide()
+        self.refresh()
+
+    def set_theme(self, key):
+        self.config["theme"] = key
+        if not self.demo:
+            save_config({"theme": key})
+        self.apply_theme()
+
+    def toggle_overtime(self):
+        # 只記今天的日期，隔天自動失效
+        value = self.now().date().isoformat() if self.overtime_var.get() else None
+        self.config["overtime_date"] = value
+        if not self.demo:
+            save_config({"overtime_date": value})
+        self.refresh()
 
     # ---- 視窗位置與選單 ----
 
@@ -516,6 +591,10 @@ class ClockApp:
     def show_menu(self, event):
         # 跑馬燈沒顯示時（週末、下班後、關掉小語），「下一句」沒有作用
         self.menu.entryconfigure(0, state="normal" if self.marquee_visible else "disabled")
+        now = self.now()
+        self.overtime_var.set(overtime_active(now, self.config))
+        self.menu.entryconfigure(2, label=f"今天加班（到 {self.config['overtime_end']}）",
+                                 state="normal" if now.weekday() < 5 else "disabled")
         self.menu.tk_popup(event.x_root, event.y_root)
 
     def reset_position(self):
